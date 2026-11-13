@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Mouse Gap Scanner (Live)</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;background:#000;color:#eee;font:15px/1.35 -apple-system,system-ui,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+  #stage{position:relative;width:100%;background:#111}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%}
+  video{object-fit:fill}
+  #hud{position:absolute;left:8px;top:8px;background:#000a;padding:6px 10px;border-radius:8px;font-size:14px;max-width:90%}
+  #panel{padding:10px 12px}
+  button{padding:12px 14px;border:0;border-radius:10px;background:#3a3a3c;color:#fff;font-size:16px;font-weight:600;margin:0 6px 8px 0}
+  button.on{background:#2f6feb}
+  button.stop{background:#d93025}
+  .row{display:flex;align-items:center;gap:10px;margin:6px 0;flex-wrap:wrap}
+  .row label{min-width:105px;color:#ccc;font-size:14px}
+  input[type=range]{flex:1;min-width:120px}
+  input[type=number]{width:80px;padding:8px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:16px}
+  select{padding:8px;border-radius:8px;background:#111;color:#fff;border:1px solid #444;font-size:16px}
+  small{color:#999}
+  #msg{padding:20px;color:#ffb4ab}
+</style>
+</head>
+<body>
+<div id="stage" style="aspect-ratio:3/4">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="ov"></canvas>
+  <div id="hud">Tap Start</div>
+</div>
+<div id="panel">
+  <button id="start" class="on">Start camera</button>
+  <button id="freeze" disabled>Freeze</button>
+  <button id="scale" disabled>Set scale</button>
+  <div class="row"><label>Mode</label>
+    <select id="mode">
+      <option value="light">Light leaks (dark inside, bright outside)</option>
+      <option value="dark">Dark gaps (lights on)</option>
+    </select></div>
+  <div class="row"><label>Sensitivity</label><input id="sens" type="range" min="10" max="80" value="35"></div>
+  <div class="row"><label>Flag ≥ (in)</label><input id="thr" type="number" step="0.01" value="0.25">
+    <label style="min-width:0">Ref (in)</label><input id="reflen" type="number" step="0.01" value="3.37"></div>
+  <small>Scale: hold a credit card flat on the wall, tap Set scale, tap both ends. Then keep the phone at that same distance (~1 ft) and sweep along the wall. Move closer or farther and the size estimate is wrong, so re-set scale. Best results: cabin dark, bright light outside (or the reverse), phone steady.</small>
+  <div id="msg"></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'), ov=$('ov'), octx=ov.getContext('2d');
+const work=document.createElement('canvas'), wctx=work.getContext('2d',{willReadFrequently:true});
+const PW=480; let PH=640, stream=null, running=false, frozen=false, picking=false, pts=[], ppi=null;
+let acc=null, lastT=0;
+
+$('start').onclick=async()=>{
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; running=false; $('start').textContent='Start camera'; $('start').className='on'; return; }
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:960}},audio:false});
+  }catch(e){ $('msg').textContent='Camera blocked: '+e.message+' (needs HTTPS and Safari camera permission).'; return; }
+  v.srcObject=stream; await v.play();
+  const vw=v.videoWidth, vh=v.videoHeight;
+  $('stage').style.aspectRatio=vw+'/'+vh;
+  PH=Math.round(PW*vh/vw); work.width=PW; work.height=PH; ov.width=PW; ov.height=PH; acc=new Float32Array(PW*PH);
+  running=true; frozen=false; $('freeze').disabled=false; $('scale').disabled=false;
+  $('start').textContent='Stop camera'; $('start').className='stop'; $('msg').textContent='';
+  requestAnimationFrame(loop);
+};
+$('freeze').onclick=()=>{frozen=!frozen; $('freeze').className=frozen?'on':''; $('freeze').textContent=frozen?'Resume':'Freeze'; if(frozen) v.pause(); else v.play();};
+$('scale').onclick=()=>{pts=[];ppi=null;picking=true;$('hud').textContent='Tap first end of reference';};
+ov.addEventListener('click',e=>{
+  if(!picking) return;
+  const r=ov.getBoundingClientRect();
+  pts.push({x:(e.clientX-r.left)*PW/r.width,y:(e.clientY-r.top)*PH/r.height});
+  if(pts.length===2){
+    picking=false;
+    const d=Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y), L=parseFloat($('reflen').value)||0;
+    ppi=(L>0&&d>4)?d/L:null;
+    $('hud').textContent=ppi?`Scale set: ¼" ≈ ${(ppi/4).toFixed(1)} px`:'Bad scale';
+  } else $('hud').textContent='Tap second end';
+});
+
+function loop(t){
+  if(!running) return;
+  requestAnimationFrame(loop);
+  if(frozen||t-lastT<120) return;   // ~8 fps analysis
+  lastT=t; analyze();
+}
+
+function analyze(){
+  const w=PW,h=PH,n=w*h;
+  wctx.drawImage(v,0,0,w,h);
+  const src=wctx.getImageData(0,0,w,h).data;
+  const g=new Float32Array(n);
+  for(let i=0;i<n;i++) g[i]=0.299*src[i*4]+0.587*src[i*4+1]+0.114*src[i*4+2];
+  const W=w+1,I=new Float64Array(W*(h+1));
+  for(let y=1;y<=h;y++){let row=0;for(let x=1;x<=w;x++){row+=g[(y-1)*w+x-1];I[y*W+x]=I[(y-1)*W+x]+row;}}
+  const R=14, mode=$('mode').value, sens=+$('sens').value;
+  const mask=new Uint8Array(n);
+  for(let y=0;y<h;y++){
+    const y0=Math.max(0,y-R),y1=Math.min(h,y+R+1);
+    for(let x=0;x<w;x++){
+      const x0=Math.max(0,x-R),x1=Math.min(w,x+R+1);
+      const mean=(I[y1*W+x1]-I[y0*W+x1]-I[y1*W+x0]+I[y0*W+x0])/((x1-x0)*(y1-y0)), val=g[y*w+x], i=y*w+x;
+      const hit = mode==='dark' ? (val<mean-sens && val<70) : (val>mean+sens && val>170);
+      // temporal smoothing: pixel must be flagged consistently
+      acc[i]=acc[i]*0.6+(hit?0.4:0);
+      mask[i]=acc[i]>0.5?1:0;
+    }
+  }
+  // distance transform
+  const D=new Uint16Array(n),BIG=60000;
+  for(let i=0;i<n;i++)D[i]=mask[i]?BIG:0;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x;if(!D[i])continue;let m=BIG;
+    if(x>0)m=Math.min(m,D[i-1]+3);else m=3;
+    if(y>0){m=Math.min(m,D[i-w]+3);if(x>0)m=Math.min(m,D[i-w-1]+4);if(x<w-1)m=Math.min(m,D[i-w+1]+4);}else m=Math.min(m,3);
+    D[i]=m;}
+  for(let y=h-1;y>=0;y--)for(let x=w-1;x>=0;x--){const i=y*w+x;if(!D[i])continue;let m=D[i];
+    if(x<w-1)m=Math.min(m,D[i+1]+3);else m=Math.min(m,3);
+    if(y<h-1){m=Math.min(m,D[i+w]+3);if(x<w-1)m=Math.min(m,D[i+w+1]+4);if(x>0)m=Math.min(m,D[i+w-1]+4);}else m=Math.min(m,3);
+    D[i]=m;}
+  // components
+  const lab=new Int32Array(n),stack=[],found=[];
+  for(let s=0;s<n;s++){
+    if(!mask[s]||lab[s])continue;
+    let maxd=0,area=0,x0=w,y0=h,x1=0,y1=0;const px=[];
+    stack.push(s);lab[s]=1;
+    while(stack.length){const i=stack.pop();px.push(i);area++;
+      const x=i%w,y=(i/w)|0;if(D[i]>maxd)maxd=D[i];
+      if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y;
+      for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){const nx=x+dx,ny=y+dy;if(nx<0||ny<0||nx>=w||ny>=h)continue;
+        const j=ny*w+nx;if(mask[j]&&!lab[j]){lab[j]=1;stack.push(j);}}}
+    found.push({px,area,wpx:2*maxd/3,x0,y0,x1,y1});
+  }
+  const thr=parseFloat($('thr').value)||0.25;
+  octx.clearRect(0,0,w,h);
+  const od=octx.createImageData(w,h);let red=0,amb=0,cy=0;const boxes=[];
+  for(const c of found){
+    if(c.area<12||c.area>n*0.06)continue;
+    const len=Math.max(c.x1-c.x0,c.y1-c.y0);
+    if(len<c.wpx*2.5)continue;           // slit-shaped only
+    let col;
+    if(ppi){const wi=c.wpx/ppi;
+      if(wi>=thr){col=[255,59,48];red++;}else if(wi>=thr*0.6){col=[255,204,0];amb++;}else continue;}
+    else if(c.wpx>=2.5){col=[0,212,255];cy++;}else continue;
+    for(const i of c.px){od.data[i*4]=col[0];od.data[i*4+1]=col[1];od.data[i*4+2]=col[2];od.data[i*4+3]=190;}
+    boxes.push({c,col});
+  }
+  octx.putImageData(od,0,0);
+  octx.lineWidth=2;
+  for(const {c,col} of boxes){octx.strokeStyle=`rgb(${col})`;octx.strokeRect(c.x0-4,c.y0-4,c.x1-c.x0+8,c.y1-c.y0+8);}
+  octx.fillStyle='#00ff88';octx.strokeStyle='#00ff88';
+  pts.forEach(p=>{octx.beginPath();octx.arc(p.x,p.y,5,0,7);octx.fill();});
+  if(pts.length===2){octx.beginPath();octx.moveTo(pts[0].x,pts[0].y);octx.lineTo(pts[1].x,pts[1].y);octx.stroke();}
+  if(!picking) $('hud').innerHTML=ppi?`<b style="color:#ff6b60">${red}</b> over ${thr}" · <b style="color:#ffd60a">${amb}</b> borderline`:`<b style="color:#00d4ff">${cy}</b> candidates · set scale`;
+}
+</script>
+</body>
+</html>
