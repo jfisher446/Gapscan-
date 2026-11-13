@@ -24,6 +24,16 @@
   select{padding:8px;border-radius:8px;background:#111;color:#fff;border:1px solid #444;font-size:16px}
   small{color:#999}
   #msg{padding:20px;color:#ffb4ab}
+  #logwrap{padding:0 12px 24px}
+  #logwrap h2{font-size:17px;margin:8px 0}
+  .ent{display:flex;gap:10px;background:#1c1c1e;border-radius:10px;padding:8px;margin-bottom:8px;align-items:flex-start}
+  .ent img{width:96px;border-radius:6px;flex:none}
+  .ent .m{flex:1;min-width:0}
+  .ent .t{font-size:13px;color:#aaa;margin-bottom:4px}
+  .ent input[type=text]{width:100%;padding:8px;border-radius:8px;border:1px solid #444;background:#111;color:#fff;font-size:15px}
+  .ent .b{display:flex;gap:12px;align-items:center;margin-top:6px;font-size:14px}
+  .ent.done{opacity:.5}
+  .ent button{padding:6px 10px;font-size:13px;margin:0}
 </style>
 </head>
 <body>
@@ -47,13 +57,21 @@
   <small>Scale: hold a credit card flat on the wall, tap Set scale, tap both ends. Then keep the phone at that same distance (~1 ft) and sweep along the wall. Move closer or farther and the size estimate is wrong, so re-set scale. Best results: cabin dark, bright light outside (or the reverse), phone steady.</small>
   <div id="msg"></div>
 </div>
+<div id="logwrap">
+  <h2>Gap log <span id="cnt" style="color:#999;font-weight:400"></span></h2>
+  <small>Tap a highlighted gap in the live view to log it with a photo. Tap empty wall to log a spot manually.</small>
+  <div style="margin:8px 0">
+    <button id="copylog">Copy list</button><button id="clearlog">Clear all</button>
+  </div>
+  <div id="log"></div>
+</div>
 
 <script>
 const $=id=>document.getElementById(id);
 const v=$('v'), ov=$('ov'), octx=ov.getContext('2d');
 const work=document.createElement('canvas'), wctx=work.getContext('2d',{willReadFrequently:true});
 const PW=480; let PH=640, stream=null, running=false, frozen=false, picking=false, pts=[], ppi=null;
-let acc=null, lastT=0;
+let acc=null, lastT=0, lastBoxes=[];
 
 $('start').onclick=async()=>{
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; running=false; $('start').textContent='Start camera'; $('start').className='on'; return; }
@@ -71,9 +89,10 @@ $('start').onclick=async()=>{
 $('freeze').onclick=()=>{frozen=!frozen; $('freeze').className=frozen?'on':''; $('freeze').textContent=frozen?'Resume':'Freeze'; if(frozen) v.pause(); else v.play();};
 $('scale').onclick=()=>{pts=[];ppi=null;picking=true;$('hud').textContent='Tap first end of reference';};
 ov.addEventListener('click',e=>{
-  if(!picking) return;
   const r=ov.getBoundingClientRect();
-  pts.push({x:(e.clientX-r.left)*PW/r.width,y:(e.clientY-r.top)*PH/r.height});
+  const x=(e.clientX-r.left)*PW/r.width, y=(e.clientY-r.top)*PH/r.height;
+  if(!picking){ logAt(x,y); return; }
+  pts.push({x,y});
   if(pts.length===2){
     picking=false;
     const d=Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y), L=parseFloat($('reflen').value)||0;
@@ -81,6 +100,49 @@ ov.addEventListener('click',e=>{
     $('hud').textContent=ppi?`Scale set: ¼" ≈ ${(ppi/4).toFixed(1)} px`:'Bad scale';
   } else $('hud').textContent='Tap second end';
 });
+
+/* ---- gap log (stored on this phone) ---- */
+let LOG=[]; try{LOG=JSON.parse(localStorage.getItem('gapLog')||'[]');}catch(e){}
+function saveLog(){ try{localStorage.setItem('gapLog',JSON.stringify(LOG));}catch(e){$('msg').textContent='Log full, clear old entries.';} }
+function logAt(x,y){
+  if(!running) return;
+  const P=14; let hit=null,best=1e9;
+  for(const b of lastBoxes){
+    if(x>=b.x0-P&&x<=b.x1+P&&y>=b.y0-P&&y<=b.y1+P){
+      const d=Math.hypot(x-(b.x0+b.x1)/2,y-(b.y0+b.y1)/2); if(d<best){best=d;hit=b;}
+    }
+  }
+  const s=document.createElement('canvas'); s.width=PW; s.height=PH;
+  const c=s.getContext('2d'); c.drawImage(v,0,0,PW,PH); c.drawImage(ov,0,0);
+  c.strokeStyle='#ffe600'; c.lineWidth=3; c.beginPath(); c.arc(x,y,16,0,7); c.stroke();
+  const id=(LOG.reduce((m,e)=>Math.max(m,e.id),0))+1;
+  LOG.push({id,t:Date.now(),note:'',sealed:false,w:hit&&hit.w?+hit.w.toFixed(2):null,auto:!!hit,img:s.toDataURL('image/jpeg',0.6)});
+  saveLog(); renderLog();
+  $('hud').textContent='Logged #'+id+(hit?'':' (manual spot)');
+}
+function fmt(t){const d=new Date(t);return d.toLocaleDateString([], {month:'short',day:'numeric'})+' '+d.toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});}
+function renderLog(){
+  const el=$('log'); el.innerHTML='';
+  $('cnt').textContent=LOG.length?`(${LOG.filter(e=>!e.sealed).length} open / ${LOG.length})`:'';
+  [...LOG].reverse().forEach(e=>{
+    const d=document.createElement('div'); d.className='ent'+(e.sealed?' done':'');
+    d.innerHTML=`<img src="${e.img}"><div class="m"><div class="t">#${e.id} · ${fmt(e.t)} · ${e.w?('~'+e.w+'"'):(e.auto?'width unknown':'manual spot')}</div>
+      <input type="text" placeholder="Where? (e.g. NE corner, under sink)" value="">
+      <div class="b"><label><input type="checkbox"> Sealed</label><button class="stop">Delete</button></div></div>`;
+    const inp=d.querySelector('input[type=text]'); inp.value=e.note;
+    inp.oninput=()=>{e.note=inp.value;saveLog();};
+    const cb=d.querySelector('input[type=checkbox]'); cb.checked=e.sealed;
+    cb.onchange=()=>{e.sealed=cb.checked;saveLog();renderLog();};
+    d.querySelector('button').onclick=()=>{ if(confirm('Delete #'+e.id+'?')){LOG=LOG.filter(z=>z!==e);saveLog();renderLog();} };
+    el.appendChild(d);
+  });
+}
+$('copylog').onclick=async()=>{
+  const txt=LOG.map(e=>`#${e.id} ${e.sealed?'[SEALED]':'[OPEN]'} ${fmt(e.t)} ${e.w?('~'+e.w+'"'):''} ${e.note}`).join('\n')||'(empty)';
+  try{await navigator.clipboard.writeText(txt);$('hud').textContent='List copied';}catch(e){$('msg').textContent=txt;}
+};
+$('clearlog').onclick=()=>{ if(LOG.length&&confirm('Delete all '+LOG.length+' entries?')){LOG=[];saveLog();renderLog();} };
+renderLog();
 
 function loop(t){
   if(!running) return;
@@ -148,6 +210,7 @@ function analyze(){
     for(const i of c.px){od.data[i*4]=col[0];od.data[i*4+1]=col[1];od.data[i*4+2]=col[2];od.data[i*4+3]=190;}
     boxes.push({c,col});
   }
+  lastBoxes=boxes.map(b=>({x0:b.c.x0,y0:b.c.y0,x1:b.c.x1,y1:b.c.y1,w:ppi?b.c.wpx/ppi:null}));
   octx.putImageData(od,0,0);
   octx.lineWidth=2;
   for(const {c,col} of boxes){octx.strokeStyle=`rgb(${col})`;octx.strokeRect(c.x0-4,c.y0-4,c.x1-c.x0+8,c.y1-c.y0+8);}
